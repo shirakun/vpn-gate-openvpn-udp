@@ -55,6 +55,11 @@ jobs:
         asset_path: output/udp.json
         asset_name: udp.json
         asset_content_type: application/json
-    - name: Delete old Releases
-      run: |
-        gh release delete $(gh release list --json name -q '.[].name' | grep -v "release-${{ github.run_id }}") --yes
+    - name: Delete releases and workflows runs
+      uses: ophub/delete-releases-workflows@main
+      with:
+        delete_releases: true
+        releases_keep_latest: 3
+        delete_workflows: true
+        workflows_keep_day: 10
+        gh_token: ${{ secrets.GITHUB_TOKEN }}
