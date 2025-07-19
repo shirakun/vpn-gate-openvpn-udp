@@ -8,6 +8,7 @@ import time
 import os
 from datetime import datetime
 import threading
+import json
 
 ERROR_MSG = "Method: {0} throw exception: {1} at: {2}"
 
@@ -209,6 +210,22 @@ class VPNGate(VPNGateBase):
             writer.writerows(self.__list_server)
         write_file.close()
 
+    def __write_json_file(self, __file_path):
+        # 提取键（key）和值（value）
+        keys = self.__list_server[1]  # 第二行为键
+        values = [row for row in self.__list_server[2:-1]]  # 从第三行开始为值，排除最后一行
+
+        # 构造新的 JSON 结构
+        json_data = []
+        for value_row in values:
+            item = dict(zip(keys, value_row))  # 将键和值组合成字典
+            json_data.append(item)
+
+        # 写入 JSON 文件
+        with open(__file_path, 'w', encoding='utf-8') as write_file:
+            json.dump(json_data, write_file, ensure_ascii=False, indent=4)
+
+
     def __process_item(self, index, el):
         t = VPNGateItem()
         t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path,
@@ -235,7 +252,10 @@ class VPNGate(VPNGateBase):
                 if len(self.__list_server) < 2:
                     print("Skip write file because empty server list")
                     return
-                self.__write_csv_file(self.__file_path)
+                # 写入 CSV 文件为 udp.csv
+                self.__write_csv_file(os.path.join(self.__file_path, 'udp.csv'))
+                # 写入 JSON 文件为 udp.json
+                self.__write_json_file(os.path.join(self.__file_path, 'udp.json'))
         except Exception as ex:
             print(ERROR_MSG.format(
                 "run", ex, datetime.now()))
