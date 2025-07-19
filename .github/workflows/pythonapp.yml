@@ -5,12 +5,12 @@ name: Python application
 
 on:
   push:
-
   pull_request:
+  schedule:
+    - cron: '*/30 * * * *'
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
