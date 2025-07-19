@@ -196,9 +196,10 @@ class VPNGateItem(VPNGateBase, threading.Thread):
 
 class VPNGate(VPNGateBase):
 
-    def __init__(self, __base_url, __file_path, __sleep_time):
+    def __init__(self, __base_url, __file_path, __json_file_path, __sleep_time):
         self.__base_url = __base_url
         self.__file_path = __file_path
+        self.__json_file_path = __json_file_path
         self.__sleep_time = __sleep_time
         self.__list_server = [['*vpn_servers']]
         self._threads = []
@@ -210,7 +211,7 @@ class VPNGate(VPNGateBase):
             writer.writerows(self.__list_server)
         write_file.close()
 
-    def __write_json_file(self, __file_path):
+    def __write_json_file(self, __json_file_path):
         # 提取键（key）和值（value）
         keys = self.__list_server[1]  # 第二行为键
         values = [row for row in self.__list_server[2:-1]]  # 从第三行开始为值，排除最后一行
@@ -222,14 +223,13 @@ class VPNGate(VPNGateBase):
             json_data.append(item)
 
         # 写入 JSON 文件
-        with open(__file_path, 'w', encoding='utf-8') as write_file:
+        with open(__json_file_path, 'w', encoding='utf-8') as write_file:
             json.dump(json_data, write_file, ensure_ascii=False, indent=4)
 
 
     def __process_item(self, index, el):
         t = VPNGateItem()
-        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path,
-                    __sleep_time=self.__sleep_time, __list_server=self.__list_server)
+        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path, __json_file_path=self.__json_file_path, __sleep_time=self.__sleep_time, __list_server=self.__list_server)
         self._threads.append(t)
         t.start()
 
@@ -253,9 +253,9 @@ class VPNGate(VPNGateBase):
                     print("Skip write file because empty server list")
                     return
                 # 写入 CSV 文件为 udp.csv
-                self.__write_csv_file(os.path.join(self.__file_path, 'udp.csv'))
+                self.__write_csv_file(self.__file_path)
                 # 写入 JSON 文件为 udp.json
-                self.__write_json_file(os.path.join(self.__file_path, 'udp.json'))
+                self.__write_json_file(self.__json_file_path)
         except Exception as ex:
             print(ERROR_MSG.format(
                 "run", ex, datetime.now()))
