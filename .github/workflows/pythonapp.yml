@@ -27,34 +27,44 @@ jobs:
         pip install -r requirements.txt
         python .
         ls -lah output
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v2
+    # - name: Create Release
+    #   id: create_release
+    #   uses: actions/create-release@v2
+    #   env:
+    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #   with:
+    #     tag_name: ${{ format('release-{0}', github.run_id) }}
+    #     release_name: ${{ format('Release {0}', github.run_id) }}
+    #     draft: false
+    #     prerelease: false
+    # - name: Upload udp.csv to Release
+    #   uses: actions/upload-release-asset@v1
+    #   env:
+    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #   with:
+    #     upload_url: ${{ steps.create_release.outputs.upload_url }}
+    #     asset_path: output/udp.csv
+    #     asset_name: udp.csv
+    #     asset_content_type: text/csv
+    # - name: Upload udp.json to Release
+    #   uses: actions/upload-release-asset@v1
+    #   env:
+    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #   with:
+    #     upload_url: ${{ steps.create_release.outputs.upload_url }}
+    #     asset_path: output/udp.json
+    #     asset_name: udp.json
+    #     asset_content_type: application/json
+    - name: Release
+      uses: softprops/action-gh-release@v2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
+        name: ${{ format('release-{0}', github.run_id) }}
         tag_name: ${{ format('release-{0}', github.run_id) }}
-        release_name: ${{ format('Release {0}', github.run_id) }}
-        draft: false
-        prerelease: false
-    - name: Upload udp.csv to Release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: output/udp.csv
-        asset_name: udp.csv
-        asset_content_type: text/csv
-    - name: Upload udp.json to Release
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: output/udp.json
-        asset_name: udp.json
-        asset_content_type: application/json
+        files: |
+          output/udp.json
+          output/udp.csv
     - name: Delete releases and workflows runs
       uses: ophub/delete-releases-workflows@main
       with:
