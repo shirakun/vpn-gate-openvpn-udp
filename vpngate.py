@@ -14,19 +14,25 @@ ERROR_MSG = "Method: {0} throw exception: {1} at: {2}"
 
 class VPNGateBase():
     def _get_url(self, url):
-        try:
-            req = request.Request(url)
-            with request.urlopen(req, timeout=8) as response:
-                if response.headers.get_content_charset() == None:
-                    encoding = 'utf-8'
+        max_retries = 10
+        retry_interval = 10
+        for attempt in range(max_retries):
+            try:
+                req = request.Request(url)
+                with request.urlopen(req, timeout=8) as response:
+                    if response.headers.get_content_charset() == None:
+                        encoding = 'utf-8'
+                    else:
+                        encoding = response.headers.get_content_charset()
+                    html = response.read().decode(encoding)
+                return html
+            except Exception as ex:
+                print(ERROR_MSG.format(
+                    "_get_url", ex, datetime.now()))
+                if attempt < max_retries - 1:  # 如果不是最后一次尝试
+                    time.sleep(retry_interval)
                 else:
-                    encoding = response.headers.get_content_charset()
-                html = response.read().decode(encoding)
-            return html
-        except Exception as ex:
-            print(ERROR_MSG.format(
-                "_get_url", ex, datetime.now()))
-            return None
+                    return None
 
 
 class VPNGateItem(VPNGateBase, threading.Thread):
