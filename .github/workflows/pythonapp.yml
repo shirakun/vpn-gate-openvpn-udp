@@ -65,6 +65,7 @@ jobs:
         files: |
           output/udp.json
           output/udp.csv
+          block.txt
     - name: Delete releases and workflows runs
       uses: ophub/delete-releases-workflows@main
       with:
