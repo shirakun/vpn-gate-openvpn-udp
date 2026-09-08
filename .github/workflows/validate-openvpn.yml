@@ -282,7 +282,7 @@ jobs:
               f = line.split('\t')
               if len(f) < 9:
                   continue
-              f = (f + [''] * 12)[:12]
+              f = (f + [''] * 13)[:13]
               idx, cc, host, proto, ip, port, status, egress, elapsed = f[:9]
               nf, abema, bahamut, gpt = f[9:13]
               vals = [run_id, sval(scope), ival(idx), sval(cc), sval(host), sval(proto), sval(ip),
