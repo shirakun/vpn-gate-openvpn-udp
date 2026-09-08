@@ -4,6 +4,8 @@ name: validate-openvpn
 # 判定方式与 autovpn.sh 一致:注入 route-nopull -> 连接成功
 # (Initialization Sequence Completed) -> tun0 出现 ->
 # curl --interface tun0 出网成功。
+# 出网成功的节点,再在隧道内用 MediaUnlockTest(unlock-test) 检测
+# Netflix(地区)/Abema/動畫瘋(Bahamut Anime)/ChatGPT 解锁情况。
 # 仅在 workflow_dispatch 时运行(不会在每次 push 时触发,无 commit-back 回环)。
 on:
   workflow_dispatch:
@@ -34,6 +36,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq openvpn curl jq netcat-openbsd >/dev/null
           openvpn --version | head -n 1
+      - name: Install unlock-test
+        run: |
+          curl -fsSL --max-time 60 https://unlock.icmp.ing/test/latest/unlock-test_linux_amd64 -o /tmp/unlock-test \
+            || curl -fsSL --max-time 60 https://github.com/HsukqiLee/MediaUnlockTest/releases/download/v1.9.9-1788067938/unlock-test_linux_amd64 -o /tmp/unlock-test
+          chmod +x /tmp/unlock-test
+          sudo mv /tmp/unlock-test /usr/local/bin/unlock-test
+          unlock-test -v 2>&1 | head -n 2 || true
       - name: Fetch current node list
         run: |
           curl -fsSL https://github.com/shirakun/vpn-gate-openvpn-udp/releases/latest/download/udp.json -o /tmp/udp.json || exit 1
@@ -51,6 +60,16 @@ jobs:
           TIMEOUT_PER_NODE="${TIMEOUT_PER_NODE:-25}"
           case "$SCOPE" in jp|all) ;; *) SCOPE=jp ;; esac
           export SCOPE MAX_NODES
+          # unlock-test 输出解析:按前缀取首个匹配行(输入已去色),去掉前缀与冒号
+          pick() {
+            awk -v p="$1" 'index($0,p)==1 { s=substr($0,length(p)+1); sub(/^[[:space:]]*:?[[:space:]]*/,"",s); print s; exit }'
+          }
+          # 摘要展示:含 "(Region: X)" 只保留地区 X;空值显示 '-'
+          compact() {
+            local t="$1" r
+            r=$(printf '%s' "$t" | sed -nE 's/^.*\(Region:[[:space:]]*([^)]*)\).*$/\1/p')
+            if [ -n "$r" ]; then printf '%s' "$r"; elif [ -n "$t" ]; then printf '%s' "$t"; else printf '%s' '-'; fi
+          }
           python3 - <<'PY'
           import os, json, re, base64
           scope = os.environ['SCOPE']
@@ -101,13 +120,14 @@ jobs:
             [ -n "$IDX" ] || continue
             OVPN="/tmp/vpn_${IDX}.ovpn"
             TOTAL=$((TOTAL+1))
+            NF='-'; ABEMA='-'; BAHAMUT='-'; GPT='-'
             echo "================ [$TOTAL] $CC $HOST ($PROTO $IP:$PORT) ================"
             if [ "$PROTO" = "tcp" ]; then
               if timeout 6 nc -z -w 5 "$IP" "$PORT" 2>/dev/null; then
                 echo ">>> raw-tcp: OPEN"
               else
                 echo ">>> raw-tcp: CLOSED (skip)"
-                printf '%s\t%s\t%s\t%s\t%s\t%s\tport_closed\t-\t0\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" >> /tmp/results.tsv
+                printf '%s\t%s\t%s\t%s\t%s\t%s\tport_closed\t-\t0\t%s\t%s\t%s\t%s\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$NF" "$ABEMA" "$BAHAMUT" "$GPT" >> /tmp/results.tsv
                 SKIP=$((SKIP+1))
                 continue
               fi
@@ -133,7 +153,21 @@ jobs:
             fi
             if [ -n "$EGRESS" ]; then
               echo ">>> RESULT: OK  egress=$EGRESS  (${ELAPSED}s)"
-              printf '%s\t%s\t%s\t%s\t%s\t%s\tok\t%s\t%s\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$EGRESS" "$ELAPSED" >> /tmp/results.tsv
+              # 隧道内检测流媒体/GPT 解锁(出口绑定 tun0)
+              UNLOCK_RAW=$(sudo timeout 90 unlock-test -I tun0 -m 4 \
+                -test 'Netflix,Abema,Bahamut Anime,OpenAI ChatGPT' 2>&1 || true)
+              UNLOCK_OUT=$(printf '%s\n' "$UNLOCK_RAW" | sed -r $'s/\x1B\[[0-9;]*[mK]//g')
+              NF=$(printf '%s\n' "$UNLOCK_OUT" | pick 'Netflix')
+              [ -n "$NF" ] || NF='-'
+              ABEMA=$(printf '%s\n' "$UNLOCK_OUT" | pick 'Abema')
+              [ -n "$ABEMA" ] || ABEMA='-'
+              BAHAMUT=$(printf '%s\n' "$UNLOCK_OUT" | pick 'Bahamut Anime')
+              [ -n "$BAHAMUT" ] || BAHAMUT='-'
+              GPT=$(printf '%s\n' "$UNLOCK_OUT" | pick 'OpenAI ChatGPT')
+              if [ -z "$GPT" ]; then GPT=$(printf '%s\n' "$UNLOCK_OUT" | pick 'ChatGPT'); fi
+              [ -n "$GPT" ] || GPT='-'
+              echo ">>> UNLOCK: Netflix=[$NF] Abema=[$ABEMA] Bahamut=[$BAHAMUT] ChatGPT=[$GPT]"
+              printf '%s\t%s\t%s\t%s\t%s\t%s\tok\t%s\t%s\t%s\t%s\t%s\t%s\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$EGRESS" "$ELAPSED" "$NF" "$ABEMA" "$BAHAMUT" "$GPT" >> /tmp/results.tsv
               OK=$((OK+1))
             else
               if [ "$UP" = "1" ]; then
@@ -147,7 +181,7 @@ jobs:
                 ST="died"
               fi
               grep -E 'AUTH_FAILED|TLS Error|Fatal|Options error|Cannot|exiting' "$LOG" 2>/dev/null | tail -n 5
-              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$ST" "$ELAPSED" >> /tmp/results.tsv
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\t%s\t%s\t%s\t%s\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$ST" "$ELAPSED" "$NF" "$ABEMA" "$BAHAMUT" "$GPT" >> /tmp/results.tsv
               FAIL=$((FAIL+1))
             fi
             sudo pkill -x openvpn 2>/dev/null
@@ -159,16 +193,16 @@ jobs:
           {
             echo "## OpenVPN 节点验证结果 (scope=$SCOPE)"
             echo
-            echo "| # | 国家 | 主机 | 协议 | 服务器:端口 | 结果 | 出口IP | 耗时(s) |"
-            echo "|---|------|------|------|-------------|------|--------|---------|"
-            while IFS=$'\t' read -r N CC HOST PROTO IP PORT ST EGRESS EL; do
+            echo "| # | 国家 | 主机 | 协议 | 服务器:端口 | 结果 | 出口IP | Netflix | Abema | 動畫瘋 | ChatGPT | 耗时(s) |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+            while IFS=$'\t' read -r N CC HOST PROTO IP PORT ST EGRESS EL NF ABEMA BAHAMUT GPT; do
               case "$ST" in
                 ok) EMOJI=":white_check_mark:" ;;
                 port_closed) EMOJI=":no_entry_sign:" ;;
                 *) EMOJI=":x:" ;;
               esac
-              printf '| %s | %s | %s | %s | %s:%s | %s %s | %s | %s |\n' \
-                "$N" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$EMOJI" "$ST" "$EGRESS" "$EL"
+              printf '| %s | %s | %s | %s | %s:%s | %s %s | %s | %s | %s | %s | %s | %s |\n' \
+                "$N" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$EMOJI" "$ST" "$EGRESS" "$(compact "$NF")" "$(compact "$ABEMA")" "$(compact "$BAHAMUT")" "$(compact "$GPT")" "$EL"
             done < /tmp/results.tsv
             echo
             echo "**total=$TOTAL, ok=$OK, fail=$FAIL, skipped(端口关闭)=$SKIP**"
