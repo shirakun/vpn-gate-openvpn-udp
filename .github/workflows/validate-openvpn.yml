@@ -1,0 +1,178 @@
+name: validate-openvpn
+
+# 验证当前 udp.json 中每个 OpenVPN 配置的连通性和可用性。
+# 判定方式与 autovpn.sh 一致:注入 route-nopull -> 连接成功
+# (Initialization Sequence Completed) -> tun0 出现 ->
+# curl --interface tun0 出网成功。
+# 仅在 workflow_dispatch 时运行(不会在每次 push 时触发,无 commit-back 回环)。
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "验证范围: jp = autovpn.sh 使用的日本节点; all = 全部节点"
+        type: choice
+        options:
+          - jp
+          - all
+        default: jp
+      max_nodes:
+        description: "最多验证几个节点(0 = 范围内全部)"
+        type: number
+        default: 0
+      timeout_per_node:
+        description: "单个节点最长等待秒数"
+        type: number
+        default: 25
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openvpn curl jq netcat-openbsd >/dev/null
+          openvpn --version | head -n 1
+      - name: Fetch current node list
+        run: |
+          curl -fsSL https://github.com/shirakun/vpn-gate-openvpn-udp/releases/latest/download/udp.json -o /tmp/udp.json || exit 1
+          echo "total_rows=$(jq length /tmp/udp.json)"
+      - name: Validate each config
+        id: validate
+        env:
+          SCOPE: ${{ github.event.inputs.scope }}
+          MAX_NODES: ${{ github.event.inputs.max_nodes }}
+          TIMEOUT_PER_NODE: ${{ github.event.inputs.timeout_per_node }}
+        run: |
+          set +e
+          SCOPE="${SCOPE:-jp}"
+          MAX_NODES="${MAX_NODES:-0}"
+          TIMEOUT_PER_NODE="${TIMEOUT_PER_NODE:-25}"
+          case "$SCOPE" in jp|all) ;; *) SCOPE=jp ;; esac
+          export SCOPE MAX_NODES
+          python3 - <<'PY'
+          import os, json, re, base64
+          scope = os.environ['SCOPE']
+          try:
+              maxn = int(os.environ.get('MAX_NODES', '0') or 0)
+          except ValueError:
+              maxn = 0
+          data = json.load(open('/tmp/udp.json'))
+          for row in data:
+              if '#HostName' in row:
+                  row['HostName'] = row.pop('#HostName')
+          def is_public(r):
+              return (r.get('HostName') or '').startswith('public-vpn')
+          def num(v):
+              try:
+                  return int(v or 0)
+              except (TypeError, ValueError):
+                  return 0
+          if scope == 'jp':
+              cands = [r for r in data if r.get('CountryShort') == 'JP' and not is_public(r)
+                       and r.get('OpenVPN_ConfigData_Base64')]
+              # 与 autovpn.sh 一致:按 UdpPort 降序
+              cands.sort(key=lambda r: num(r.get('UdpPort')), reverse=True)
+          else:
+              cands = [r for r in data if not is_public(r)
+                       and r.get('OpenVPN_ConfigData_Base64')]
+              cands.sort(key=lambda r: num(r.get('Score')), reverse=True)
+          if maxn and maxn > 0:
+              cands = cands[:maxn]
+          with open('/tmp/cands.txt', 'w') as f:
+              for i, r in enumerate(cands):
+                  cfg = base64.b64decode(r['OpenVPN_ConfigData_Base64']).decode('utf-8', 'replace')
+                  m = re.search(r'^remote\s+(\S+)\s+(\d+)', cfg, re.M)
+                  p = re.search(r'^proto\s+(\w+)', cfg, re.M)
+                  ip = m.group(1) if m else ''
+                  port = m.group(2) if m else ''
+                  proto = p.group(1) if p else '?'
+                  host = r.get('HostName') or r.get('IP') or ''
+                  cc = r.get('CountryShort') or '?'
+                  with open('/tmp/vpn_%03d.ovpn' % i, 'w', newline='\n') as g:
+                      g.write(cfg)
+                  f.write('%d\t%s\t%s\t%s\t%s\t%s\n' % (i, cc, host, ip, port, proto))
+          print('scope=%s candidates=%d' % (scope, len(cands)))
+          PY
+          TOTAL=0; OK=0; FAIL=0; SKIP=0
+          : > /tmp/results.tsv
+          while IFS=$'\t' read -r IDX CC HOST IP PORT PROTO; do
+            [ -n "$IDX" ] || continue
+            OVPN="/tmp/vpn_${IDX}.ovpn"
+            TOTAL=$((TOTAL+1))
+            echo "================ [$TOTAL] $CC $HOST ($PROTO $IP:$PORT) ================"
+            if [ "$PROTO" = "tcp" ]; then
+              if timeout 6 nc -z -w 5 "$IP" "$PORT" 2>/dev/null; then
+                echo ">>> raw-tcp: OPEN"
+              else
+                echo ">>> raw-tcp: CLOSED (skip)"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\tport_closed\t-\t0\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" >> /tmp/results.tsv
+                SKIP=$((SKIP+1))
+                continue
+              fi
+            fi
+            LOG="/tmp/vpn_${IDX}.log"
+            sudo rm -f "$LOG"
+            sed -i '/^[[:space:]]*client[[:space:]]*$/a route-nopull' "$OVPN"
+            sudo openvpn --config "$OVPN" --daemon --log "$LOG" \
+                --verb 3 --connect-retry 1 --connect-timeout 8 --auth-nocache \
+                --user nobody --group nogroup
+            sudo chmod 666 "$LOG" 2>/dev/null
+            START=$SECONDS
+            UP=0
+            while [ $((SECONDS-START)) -lt "$TIMEOUT_PER_NODE" ]; do
+              if grep -q "Initialization Sequence Completed" "$LOG" 2>/dev/null; then UP=1; break; fi
+              if ! pgrep -x openvpn >/dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            ELAPSED=$((SECONDS-START))
+            EGRESS=""
+            if [ "$UP" = "1" ]; then
+              EGRESS=$(curl --interface tun0 --max-time 8 -sS https://api64.ipify.org 2>/dev/null)
+            fi
+            if [ -n "$EGRESS" ]; then
+              echo ">>> RESULT: OK  egress=$EGRESS  (${ELAPSED}s)"
+              printf '%s\t%s\t%s\t%s\t%s\t%s\tok\t%s\t%s\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$EGRESS" "$ELAPSED" >> /tmp/results.tsv
+              OK=$((OK+1))
+            else
+              if [ "$UP" = "1" ]; then
+                echo ">>> RESULT: FAIL  (init ok 但出网失败, ${ELAPSED}s)"
+                ST="no_egress"
+              elif pgrep -x openvpn >/dev/null 2>&1; then
+                echo ">>> RESULT: FAIL  (超时未连上, ${ELAPSED}s)"
+                ST="timeout"
+              else
+                echo ">>> RESULT: FAIL  (openvpn 退出, ${ELAPSED}s)"
+                ST="died"
+              fi
+              grep -E 'AUTH_FAILED|TLS Error|Fatal|Options error|Cannot|exiting' "$LOG" 2>/dev/null | tail -n 5
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$TOTAL" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$ST" "$ELAPSED" >> /tmp/results.tsv
+              FAIL=$((FAIL+1))
+            fi
+            sudo pkill -x openvpn 2>/dev/null
+            sleep 2
+          done < /tmp/cands.txt
+          echo "================ 汇总 ================"
+          echo "total=$TOTAL ok=$OK fail=$FAIL skipped=$SKIP"
+          echo "ALL_DONE ok=$OK fail=$FAIL skipped=$SKIP total=$TOTAL"
+          {
+            echo "## OpenVPN 节点验证结果 (scope=$SCOPE)"
+            echo
+            echo "| # | 国家 | 主机 | 协议 | 服务器:端口 | 结果 | 出口IP | 耗时(s) |"
+            echo "|---|------|------|------|-------------|------|--------|---------|"
+            while IFS=$'\t' read -r N CC HOST PROTO IP PORT ST EGRESS EL; do
+              case "$ST" in
+                ok) EMOJI=":white_check_mark:" ;;
+                port_closed) EMOJI=":no_entry_sign:" ;;
+                *) EMOJI=":x:" ;;
+              esac
+              printf '| %s | %s | %s | %s | %s:%s | %s %s | %s | %s |\n' \
+                "$N" "$CC" "$HOST" "$PROTO" "$IP" "$PORT" "$EMOJI" "$ST" "$EGRESS" "$EL"
+            done < /tmp/results.tsv
+            echo
+            echo "**total=$TOTAL, ok=$OK, fail=$FAIL, skipped(端口关闭)=$SKIP**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 全部失败视为 workflow 失败,便于在 Actions 页面直接看到
+          if [ "$TOTAL" -gt 0 ] && [ "$OK" -eq 0 ]; then exit 1; fi
+          exit 0
