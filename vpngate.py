@@ -1,25 +1,35 @@
 
 from pyquery import PyQuery
 from urllib import request
+from urllib.parse import urlparse
 import re
 import csv
 import base64
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 import json
 
 ERROR_MSG = "Method: {0} throw exception: {1} at: {2}"
 
+OFFICIAL_SITE_URL = "https://www.vpngate.net"
+MIRROR_SITES_PAGE_URL = OFFICIAL_SITE_URL + "/ja/sites.aspx"
+
 class VPNGateBase():
+    # 网络请求参数 (与原有行为一致; 映像站快速尝试会覆盖为 1 次)
+    _max_retries = 10
+    _retry_interval = 10
+    _timeout = 8
+
     def _get_url(self, url):
-        max_retries = 10
-        retry_interval = 10
+        max_retries = self._max_retries
+        retry_interval = self._retry_interval
+        timeout = self._timeout
         for attempt in range(max_retries):
             try:
                 req = request.Request(url)
-                with request.urlopen(req, timeout=8) as response:
+                with request.urlopen(req, timeout=timeout) as response:
                     if response.headers.get_content_charset() == None:
                         encoding = 'utf-8'
                     else:
@@ -202,11 +212,18 @@ class VPNGateItem(VPNGateBase, threading.Thread):
 
 class VPNGate(VPNGateBase):
 
-    def __init__(self, __base_url, __file_path, __json_file_path, __sleep_time):
+    def __init__(self, __base_url, __file_path, __json_file_path, __sleep_time,
+                 retries=None, retry_interval=None, timeout=None):
         self.__base_url = __base_url
         self.__file_path = __file_path
         self.__json_file_path = __json_file_path
         self.__sleep_time = __sleep_time
+        if retries is not None:
+            self._max_retries = retries
+        if retry_interval is not None:
+            self._retry_interval = retry_interval
+        if timeout is not None:
+            self._timeout = timeout
         self.__list_server = [['*vpn_servers']]
         self._threads = []
 
@@ -235,7 +252,7 @@ class VPNGate(VPNGateBase):
 
     def __process_item(self, index, el):
         t = VPNGateItem()
-        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path, __json_file_path=self.__json_file_path, __sleep_time=self.__sleep_time, __list_server=self.__list_server)
+        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path, __json_file_path=self.__json_file_path, __sleep_time=self.__sleep_time, __list_server=self.__list_server, _max_retries=self._max_retries, _retry_interval=self._retry_interval, _timeout=self._timeout)
         self._threads.append(t)
         t.start()
 
@@ -245,6 +262,9 @@ class VPNGate(VPNGateBase):
                 lock_file.write("{0}".format(datetime.now()))
                 lock_file.close()
             html = self._get_url(self.__base_url+'/en/')
+            if html is None:
+                print("Skip write file because cannot fetch list page: {0}".format(self.__base_url + '/en/'))
+                return False
             if html is not None:
                 pq = PyQuery(html)
                 self.__list_server.append([
@@ -257,14 +277,16 @@ class VPNGate(VPNGateBase):
                     t.join()
                 if len(self.__list_server) < 2:
                     print("Skip write file because empty server list")
-                    return
+                    return False
                 # 写入 CSV 文件为 udp.csv
                 self.__write_csv_file(self.__file_path)
                 # 写入 JSON 文件为 udp.json
                 self.__write_json_file(self.__json_file_path)
+                return True
         except Exception as ex:
             print(ERROR_MSG.format(
                 "run", ex, datetime.now()))
+            return False
         finally:
             if os.path.exists(lock_file_path):
                 # Remove lock when complete
@@ -282,5 +304,81 @@ class VPNGate(VPNGateBase):
                     print("Lock file expired. Script coninue to run.\n")
                 else:
                     print("Lock file found. Script currently runing.\n")
-                    return
-        self.start_process(lock_file_path)
+                    return False
+        return self.start_process(lock_file_path)
+
+
+# --- VPN Gate 映像站(镜像站)清单支持 ---
+
+MIRROR_SITES_FILE = "mirror_sites.json"
+
+
+def _normalize_mirror_url(href):
+    """
+    把映像站链接规整为根地址(scheme://host:port), 并剔除官网本身。
+    映像站页面与官网结构一致, 只要把 base url 换掉即可整条流水线复用。
+    """
+    if not href or not href.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(href)
+    base = "{0}://{1}".format(parsed.scheme, parsed.netloc)
+    if base == OFFICIAL_SITE_URL or base == "http://www.vpngate.net":
+        return None
+    return base
+
+
+def fetch_mirror_urls(sites_url=MIRROR_SITES_PAGE_URL):
+    """
+    从官网映像站清单页抓取映像站根地址(去重、保持页面顺序)。
+    失败或解析为空时返回空列表, 由调用方决定是否保留旧清单。
+    """
+    fetcher = VPNGateBase()
+    fetcher._max_retries = 1  # 刷新清单只快速尝试一次
+    html = fetcher._get_url(sites_url)
+    if not html:
+        return []
+    urls = []
+    for item in PyQuery(html)("ul.listBigArrow a").items():
+        base = _normalize_mirror_url(item.attr("href"))
+        if base and base not in urls:
+            urls.append(base)
+    return urls
+
+
+def load_mirror_urls(file_path=MIRROR_SITES_FILE):
+    """
+    读取上次保存的映像站清单。文件不存在或损坏时返回空列表(调用方将直接使用官网)。
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as mirror_file:
+            data = json.load(mirror_file)
+        urls = data.get("urls")
+        if isinstance(urls, list):
+            return [u for u in urls if isinstance(u, str) and u]
+    except FileNotFoundError:
+        return []
+    except Exception as ex:
+        print(ERROR_MSG.format("load_mirror_urls", ex, datetime.now()))
+    return []
+
+
+def update_mirror_urls_file(file_path=MIRROR_SITES_FILE, urls=None):
+    """
+    仅在映像站 URL 顺序列表发生变化时覆写清单文件, 避免每次运行都产生 git 提交。
+    返回是否发生了写入。
+    """
+    cleaned = []
+    for url in (urls or []):
+        if url and url not in cleaned:
+            cleaned.append(url)
+    if cleaned == load_mirror_urls(file_path):
+        print("Mirror site list unchanged.")
+        return False
+    data = {
+        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "urls": cleaned,
+    }
+    with open(file_path, "w", encoding="utf-8") as mirror_file:
+        json.dump(data, mirror_file, ensure_ascii=False, indent=2)
+    print("Mirror site list saved to {0} ({1} sites).".format(file_path, len(cleaned)))
+    return True

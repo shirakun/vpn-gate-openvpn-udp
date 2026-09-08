@@ -5,9 +5,18 @@ name: Python application
 
 on:
   push:
+    # Pushes that only touch mirror_sites.json (the commit written back by this
+    # workflow) must not trigger the whole pipeline again.
+    paths-ignore:
+      - 'mirror_sites.json'
   pull_request:
   schedule:
     - cron: '0,30 * * * *'
+
+# Serialize update runs so a scheduled run and a push never run concurrently.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -27,6 +36,21 @@ jobs:
         pip install -r requirements.txt
         python .
         ls -lah output
+    - name: Commit mirror sites list back
+      if: >-
+        (github.event_name == 'schedule' ||
+         (github.event_name == 'push' && github.ref == 'refs/heads/master')) &&
+        github.repository == 'shirakun/vpn-gate-openvpn-udp'
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add mirror_sites.json
+        if git diff --cached --quiet; then
+          echo "mirror_sites.json unchanged, skip commit"
+          exit 0
+        fi
+        git commit -m "Update mirror sites list"
+        git push origin HEAD:master
     # - name: Create Release
     #   id: create_release
     #   uses: actions/create-release@v2
