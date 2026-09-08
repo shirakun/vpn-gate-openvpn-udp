@@ -90,7 +90,7 @@ jobs:
                   proto = p.group(1) if p else '?'
                   host = r.get('HostName') or r.get('IP') or ''
                   cc = r.get('CountryShort') or '?'
-                  with open('/tmp/vpn_%03d.ovpn' % i, 'w', newline='\n') as g:
+                  with open('/tmp/vpn_%d.ovpn' % i, 'w', newline='\n') as g:
                       g.write(cfg)
                   f.write('%d\t%s\t%s\t%s\t%s\t%s\n' % (i, cc, host, ip, port, proto))
           print('scope=%s candidates=%d' % (scope, len(cands)))
