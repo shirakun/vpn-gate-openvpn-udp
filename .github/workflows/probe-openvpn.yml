@@ -1,7 +1,7 @@
 name: probe-openvpn
 
-# Disposable capability probe v3: fix step order (mktun AFTER openvpn install),
-# raw TCP precheck per server, try more candidates to find a live endpoint.
+# Disposable capability probe v4: longer wait for TLS-reachable servers,
+# detect PUSH_REPLY/init, dual egress test (route-nopull parity + routed probe).
 on:
   push:
   workflow_dispatch:
@@ -16,25 +16,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq openvpn curl jq netcat-openbsd >/dev/null
           openvpn --version | head -n 1
-      - name: Tun capability test
-        run: |
-          set -x
-          echo "--- runner public ip ---"
-          curl -sS --max-time 15 https://api64.ipify.org; echo
-          echo "--- /dev/net/tun ---"
-          ls -l /dev/net/tun || true
-          sudo modprobe tun 2>&1 || true
-          sudo mkdir -p /dev/net
-          if [ ! -e /dev/net/tun ]; then sudo mknod /dev/net/tun c 10 200 2>&1 || true; fi
-          ls -l /dev/net/tun || true
-          echo "--- mktun ---"
-          sudo openvpn --mktun --dev tun0 --dev-type tun 2>&1 && echo TUN_CREATE_OK || echo TUN_CREATE_FAIL
-          ip -4 addr show tun0 2>&1 || true
-          echo "--- bring up + addr ---"
-          sudo ip addr add 10.99.0.1/24 dev tun0 2>&1 && sudo ip link set tun0 up 2>&1 && echo TUN_UP_OK || echo TUN_UP_FAIL
-          ip -4 addr show tun0 2>&1 || true
-          sudo openvpn --rmtun --dev tun0 2>&1 || true
-          ip -4 addr show tun0 2>&1 || true
       - name: Fetch configs and test
         run: |
           set +e
@@ -54,7 +35,7 @@ jobs:
                    and not (r.get('HostName') or '').startswith('public-vpn')
                    and r.get('OpenVPN_ConfigData_Base64')]
           other.sort(key=lambda r: int(r.get('Score') or 0), reverse=True)
-          cands = jp[:3] + other[:5]
+          cands = jp[:3] + other[:2]
           print('servers=%d jp=%d trying=%d' % (len(data), len(jp), len(cands)))
           for i, r in enumerate(cands):
               cfg = base64.b64decode(r['OpenVPN_ConfigData_Base64']).decode('utf-8', 'replace')
@@ -63,10 +44,9 @@ jobs:
               name = r.get('HostName') or r.get('IP')
               with open('/tmp/c%02d.ovpn' % i, 'w', newline='\n') as f:
                   f.write(cfg)
-              print('c%02d host=%s cc=%s proto=%s remote=%s:%s score=%s has_auth_pass=%s has_client=%s' % (
+              print('c%02d host=%s cc=%s proto=%s remote=%s:%s score=%s' % (
                   i, name, r.get('CountryShort'), p.group(1) if p else '?',
-                  m.group(1) if m else '?', m.group(2) if m else '?',
-                  r.get('Score'), 'auth-user-pass' in cfg, bool(re.search(r'^client\s*$', cfg, re.M))))
+                  m.group(1) if m else '?', m.group(2) if m else '?', r.get('Score')))
           PY
           OK_COUNT=0
           for ovpn in /tmp/c0*.ovpn; do
@@ -76,45 +56,41 @@ jobs:
             PROTO=$(grep -m1 '^proto ' "$ovpn" | awk '{print $2}')
             echo "================ $ovpn ($PROTO $IP:$PORT) ================"
             if [ "$PROTO" = "tcp" ]; then
-              if timeout 6 nc -z -w 5 "$IP" "$PORT" 2>/dev/null; then
-                echo ">>> raw-tcp: OPEN"
-              else
-                echo ">>> raw-tcp: CLOSED/UNREACHABLE (skip openvpn attempt)"
-                continue
-              fi
-            else
-              echo ">>> proto=udp, no raw precheck (will attempt)"
+              if timeout 6 nc -z -w 5 "$IP" "$PORT" 2>/dev/null; then echo ">>> raw-tcp: OPEN"; else echo ">>> raw-tcp: CLOSED"; fi
             fi
             sudo rm -f /tmp/vpn.log
             sed -i '/^[[:space:]]*client[[:space:]]*$/a route-nopull' "$ovpn"
             sudo openvpn --config "$ovpn" --daemon --log /tmp/vpn.log \
                 --verb 4 --connect-retry 1 --connect-timeout 8 --auth-nocache \
                 --user nobody --group nogroup
-            UP=0
-            for i in $(seq 1 10); do
+            START=$SECONDS
+            TLS=0; UP=0; PUSH=0
+            while [ $((SECONDS-START)) -lt 80 ]; do
               if grep -q "Initialization Sequence Completed" /tmp/vpn.log 2>/dev/null; then UP=1; break; fi
+              grep -q "promoted to trusted" /tmp/vpn.log 2>/dev/null && TLS=1
+              grep -q "PUSH_REPLY" /tmp/vpn.log 2>/dev/null && PUSH=1
               if ! pgrep -x openvpn >/dev/null 2>&1; then break; fi
               sleep 3
             done
+            echo "elapsed=$((SECONDS-START))s tls=$TLS push_reply=$PUSH up=$UP"
             if [ "$UP" = "1" ]; then
               OK_COUNT=$((OK_COUNT+1))
               echo ">>> init-sequence: OK"
               ip -4 addr show tun0 2>/dev/null | grep -E 'inet ' || true
-              echo ">>> routes:"; ip route show dev tun0 2>/dev/null || true
+              echo ">>> egress test A (autovpn.sh parity: curl --interface tun0):"
               EGRESS=$(curl --interface tun0 --max-time 15 -sS https://api64.ipify.org 2>/dev/null)
-              if [ -n "$EGRESS" ]; then
-                echo ">>> egress via tun0: $EGRESS"
-                curl -sS --max-time 10 "http://ip-api.com/json/$EGRESS?fields=status,message,country,countryCode,query" || true
-                echo
-              else
-                echo ">>> egress via tun0: NONE (no route / blocked)"
-              fi
+              if [ -n "$EGRESS" ]; then echo ">>> egress A via tun0: $EGRESS"; else echo ">>> egress A: NONE"; fi
+              echo ">>> egress test B (route probe target via tun0):"
+              GW=$(ip -4 addr show tun0 | awk '/inet /{print $2}' | cut -d/ -f1)
+              sudo ip route add 1.1.1.1/32 dev tun0 2>/dev/null
+              EGRESS2=$(curl --interface tun0 --max-time 15 -sS https://1.1.1.1/cdn-cgi/trace 2>/dev/null | grep -E '^ip=')
+              if [ -n "$EGRESS2" ]; then echo ">>> egress B via tun0: $EGRESS2"; else echo ">>> egress B: NONE"; fi
+              sudo ip route del 1.1.1.1/32 dev tun0 2>/dev/null
             else
-              echo ">>> init-sequence: FAILED"
-              if pgrep -x openvpn >/dev/null 2>&1; then echo "(openvpn still alive after wait)"; else echo "(openvpn exited)"; fi
+              echo ">>> init-sequence: FAILED (still_alive=$(pgrep -x openvpn >/dev/null && echo yes || echo no))"
             fi
             echo "--- vpn.log tail ---"
-            sudo cat /tmp/vpn.log 2>&1 | tail -n 25
+            sudo cat /tmp/vpn.log 2>&1 | tail -n 30
             sudo pkill -x openvpn 2>/dev/null
             sleep 2
           done
