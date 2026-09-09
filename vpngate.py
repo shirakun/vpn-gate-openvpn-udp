@@ -16,6 +16,12 @@ ERROR_MSG = "Method: {0} throw exception: {1} at: {2}"
 OFFICIAL_SITE_URL = "https://www.vpngate.net"
 MIRROR_SITES_PAGE_URL = OFFICIAL_SITE_URL + "/ja/sites.aspx"
 
+# The list page carries up to ~100 relays; launching one download thread per row
+# makes the source (official or mirror) drop connections ("Remote end closed
+# connection"), discarding many otherwise usable nodes. Cap the concurrent
+# config downloads with a shared semaphore; parsing stays threaded as before.
+CONFIG_DOWNLOAD_CONCURRENCY = 10
+
 class VPNGateBase():
     # 网络请求参数 (与原有行为一致; 映像站快速尝试会覆盖为 1 次)
     _max_retries = 10
@@ -186,8 +192,15 @@ class VPNGateItem(VPNGateBase, threading.Thread):
             elif props[0] == 'udp':
                 server[16] = props[1]
         server = self.__fill_other_value(all_td, server)
-        # OpenVPN_ConfigData_Base64
-        server[14] = self.__get_openvpn_config_base64(items)
+        # OpenVPN_ConfigData_Base64 (bounded concurrency; see CONFIG_DOWNLOAD_CONCURRENCY)
+        semaphore = self.__getattribute__('__download_semaphore')
+        if semaphore is not None:
+            semaphore.acquire()
+        try:
+            server[14] = self.__get_openvpn_config_base64(items)
+        finally:
+            if semaphore is not None:
+                semaphore.release()
         # L2TP support
         a_l2tp = all_td.eq(5).find('a[href="howto_l2tp.aspx"]')
         if a_l2tp.length > 0:
@@ -226,6 +239,9 @@ class VPNGate(VPNGateBase):
             self._timeout = timeout
         self.__list_server = [['*vpn_servers']]
         self._threads = []
+        # Shared by every VPNGateItem thread to bound concurrent config downloads.
+        self.__download_semaphore = threading.BoundedSemaphore(
+            CONFIG_DOWNLOAD_CONCURRENCY)
 
     def __write_csv_file(self, __file_path):
         csv.register_dialect('myDialect', delimiter=',', lineterminator='\n')
@@ -252,7 +268,7 @@ class VPNGate(VPNGateBase):
 
     def __process_item(self, index, el):
         t = VPNGateItem()
-        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path, __json_file_path=self.__json_file_path, __sleep_time=self.__sleep_time, __list_server=self.__list_server, _max_retries=self._max_retries, _retry_interval=self._retry_interval, _timeout=self._timeout)
+        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path, __json_file_path=self.__json_file_path, __sleep_time=self.__sleep_time, __list_server=self.__list_server, _max_retries=self._max_retries, _retry_interval=self._retry_interval, _timeout=self._timeout, __download_semaphore=self.__download_semaphore)
         self._threads.append(t)
         t.start()
 
