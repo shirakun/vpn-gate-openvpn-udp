@@ -10,7 +10,10 @@
 #
 # Env: DB_HOST, DB_USER, DB_NAME, MYSQL_PWD, RUN_ID,
 #      SHARD_INDEX, SHARD_COUNT, TIMEOUT_PER_NODE
-# Exit: 0 normally; 1 only when this shard tested >=1 node and ALL failed.
+# Exit: 0 whenever node tests ran to completion. A shard whose nodes are all
+# unreachable simply has no usable node right now - that outcome is recorded as
+# results and shown in the summary, it never fails the run. Non-zero exits are
+# left to genuine operational/script errors (missing tools/env, crash).
 set -euo pipefail
 
 SHARD_INDEX="${SHARD_INDEX:-0}"
@@ -205,9 +208,16 @@ if [ -n "$SUMMARY" ]; then
     done < /tmp/results.tsv
     echo
     echo "**shard total=${TOTAL}, ok=${OK}, fail=${FAIL}, skipped=${SKIP}**"
+    if [ "${TOTAL}" -gt 0 ] && [ "${OK}" -eq 0 ]; then
+      echo "**本 shard 无可用节点(全部失败)— 已记录结果,不视为运行失败。**"
+    fi
   } >> "$SUMMARY"
 fi
 
-# Mirrors the previous validate workflow: fail only when all tested nodes failed.
-if [ "$TOTAL" -gt 0 ] && [ "$OK" -eq 0 ]; then exit 1; fi
+# No usable node is a result, not an error: an all-failed shard means this batch
+# has no reachable node right now, which is recorded (and shown above) instead
+# of failing the run. Unexpected operational errors still abort via `set -e`.
+if [ "$TOTAL" -gt 0 ] && [ "$OK" -eq 0 ]; then
+  echo "No usable node in this shard (total=${TOTAL}, ok=0, fail=${FAIL}, skipped=${SKIP}); recorded as results."
+fi
 exit 0

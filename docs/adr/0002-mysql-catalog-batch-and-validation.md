@@ -15,4 +15,4 @@ Consequences:
 - MySQL write failures never block the Release upload or fail the workflow (they warn in the log); if the batch store failed, the validate job finds no nodes for its run id and skips itself green.
 - Only the most recent catalog snapshot and each node's most recent result are retained; older batches and their cascaded results disappear on the next successful store.
 - Deleting a node row (host vanished from a newer catalog) automatically deletes its validation result through the foreign key.
-- Validation now runs up to twice per hour against live nodes, costing ~5 parallel runner-minutes per run; a shard fails the run only when it tested at least one node and every one of them failed.
+- Validation now runs up to twice per hour against live nodes, costing ~5 parallel runner-minutes per run. Node unreachability never fails the run: a shard (or a whole batch) whose nodes all fail to connect simply has no usable node right now, which is recorded in the results and called out in the step summary rather than treated as an error. Non-green runs are reserved for genuine operational problems (missing secrets/tools, unexpected script errors).
