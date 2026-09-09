@@ -16,11 +16,14 @@ ERROR_MSG = "Method: {0} throw exception: {1} at: {2}"
 OFFICIAL_SITE_URL = "https://www.vpngate.net"
 MIRROR_SITES_PAGE_URL = OFFICIAL_SITE_URL + "/ja/sites.aspx"
 
-# The list page carries up to ~100 relays; launching one download thread per row
-# makes the source (official or mirror) drop connections ("Remote end closed
-# connection"), discarding many otherwise usable nodes. Cap the concurrent
-# config downloads with a shared semaphore; parsing stays threaded as before.
-CONFIG_DOWNLOAD_CONCURRENCY = 10
+# The list page carries up to ~100 relays. Downloading every config in one
+# parallel burst per row makes the source (official or mirror) reset or close
+# the connections ("Connection reset by peer" / "Remote end closed"), silently
+# discarding most nodes: measured yield on a strict mirror is ~25 rows at 10
+# concurrent downloads vs ~96 at 3. Cap config downloads with a shared
+# semaphore (parsing stays threaded as before); 3 keeps near-full yield while
+# finishing well inside the 30-minute schedule.
+CONFIG_DOWNLOAD_CONCURRENCY = 3
 
 class VPNGateBase():
     # 网络请求参数 (与原有行为一致; 映像站快速尝试会覆盖为 1 次)
