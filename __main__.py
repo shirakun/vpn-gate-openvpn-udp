@@ -54,9 +54,10 @@ def run_update(base_url, retries=None, retry_interval=None, timeout=None):
 
 
 # A healthy mirror serves configs for ~all rows of its list (~100). Some mirrors
-# only proxy a small subset (measured ~15-18 rows even with serial downloads), so
-# a run that "succeeds" with a tiny yield must not stop the rotation.
-MIN_SERVER_ROWS = 30
+# only proxy a subset (~15-45 rows even with bounded downloads), so a run that
+# "succeeds" with a small yield must not stop the rotation: keep trying the
+# remaining mirrors and accept the first one that clears this bar.
+MIN_SERVER_ROWS = 50
 
 
 def _count_json_rows():
