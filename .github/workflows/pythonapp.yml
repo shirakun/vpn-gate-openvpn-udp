@@ -39,6 +39,26 @@ jobs:
         pip install -r requirements.txt
         python .
         ls -lah output
+    # Record which source produced this snapshot (mirror URL or official site)
+    # so the Release notes carry the provenance. The node count is informational
+    # only - it never decides success or failure of the run.
+    - name: Load scrape provenance
+      run: |
+        if [ -f output/source.env ]; then
+          cat output/source.env >> "$GITHUB_ENV"
+        else
+          echo "output/source.env not found; provenance will be empty"
+        fi
+    - name: Prepare release notes
+      run: |
+        {
+          echo "## Update summary"
+          echo ""
+          echo "- Source type: \`${SOURCE_TYPE:-none}\`"
+          echo "- Source URL: '${SOURCE_URL:-unknown}'"
+          echo "- Node count: ${SOURCE_NODES:-0}"
+        } > output/release_notes.md
+        cat output/release_notes.md
     # DB write failures are allowed: the catalog snapshot must never block the
     # Release upload (ADR 0002). If this step fails, the validate job simply
     # finds no nodes for this batch and skips itself.
@@ -79,6 +99,7 @@ jobs:
       with:
         name: ${{ format('release-{0}', github.run_id) }}
         tag_name: ${{ format('release-{0}', github.run_id) }}
+        body_path: output/release_notes.md
         files: |
           output/udp.json
           output/udp.csv
