@@ -1,5 +1,8 @@
-# This workflow will install Python dependencies, run tests and lint with a single version of Python
-# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+# Scrapes the VPN Gate mirror list, publishes the snapshot as a GitHub Release,
+# mirrors the snapshot into MySQL (vpn_nodes, one batch per run id), then
+# validates every node of that batch (connectivity + streaming unlock) across
+# 5 parallel shards and stores per-node results (vpn_validate_results).
+# See docs/adr/0002 for the batch/UPSERT/delete semantics and failure policy.
 
 name: Python application
 
@@ -36,6 +39,24 @@ jobs:
         pip install -r requirements.txt
         python .
         ls -lah output
+    # DB write failures are allowed: the catalog snapshot must never block the
+    # Release upload (ADR 0002). If this step fails, the validate job simply
+    # finds no nodes for this batch and skips itself.
+    - name: Store server snapshot to MySQL
+      if: >-
+        (github.event_name == 'schedule' ||
+         (github.event_name == 'push' && github.ref == 'refs/heads/master')) &&
+        github.repository == 'shirakun/vpn-gate-openvpn-udp'
+      continue-on-error: true
+      env:
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_NAME: ${{ secrets.DB_NAME }}
+        DB_PASS: ${{ secrets.DB_PASS }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        source venv/bin/activate
+        python .github/scripts/store_nodes.py output/udp.json
     - name: Commit mirror sites list back
       if: >-
         (github.event_name == 'schedule' ||
@@ -51,34 +72,6 @@ jobs:
         fi
         git commit -m "Update mirror sites list"
         git push origin HEAD:master
-    # - name: Create Release
-    #   id: create_release
-    #   uses: actions/create-release@v2
-    #   env:
-    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    #   with:
-    #     tag_name: ${{ format('release-{0}', github.run_id) }}
-    #     release_name: ${{ format('Release {0}', github.run_id) }}
-    #     draft: false
-    #     prerelease: false
-    # - name: Upload udp.csv to Release
-    #   uses: actions/upload-release-asset@v1
-    #   env:
-    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    #   with:
-    #     upload_url: ${{ steps.create_release.outputs.upload_url }}
-    #     asset_path: output/udp.csv
-    #     asset_name: udp.csv
-    #     asset_content_type: text/csv
-    # - name: Upload udp.json to Release
-    #   uses: actions/upload-release-asset@v1
-    #   env:
-    #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    #   with:
-    #     upload_url: ${{ steps.create_release.outputs.upload_url }}
-    #     asset_path: output/udp.json
-    #     asset_name: udp.json
-    #     asset_content_type: application/json
     - name: Release
       uses: softprops/action-gh-release@v2
       env:
@@ -98,3 +91,71 @@ jobs:
         delete_workflows: true
         workflows_keep_day: 10
         gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Reads the batch that `build` just stored in MySQL and validates every node:
+  # connectivity through tun0, then Netflix/Abema/Bahamut/ChatGPT unlock tests.
+  # The batch is split across 5 parallel shards (one runner each).
+  validate:
+    name: validate (${{ matrix.shard-index }}/5)
+    needs: build
+    if: >-
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/master')) &&
+      github.repository == 'shirakun/vpn-gate-openvpn-udp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard-index: [0, 1, 2, 3, 4]
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq openvpn curl jq netcat-openbsd default-mysql-client >/dev/null
+        openvpn --version | head -n 1
+        mysql --version
+    - name: Install unlock-test
+      run: |
+        curl -fsSL --max-time 60 https://unlock.icmp.ing/test/latest/unlock-test_linux_amd64 -o /tmp/unlock-test \
+          || curl -fsSL --max-time 60 https://github.com/HsukqiLee/MediaUnlockTest/releases/download/v1.9.9-1788067938/unlock-test_linux_amd64 -o /tmp/unlock-test
+        chmod +x /tmp/unlock-test
+        sudo mv /tmp/unlock-test /usr/local/bin/unlock-test
+        unlock-test -v 2>&1 | head -n 2 || true
+    - name: Set up Python 3.13
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.13'
+    - name: Install Python deps for results writer
+      run: |
+        python -m venv /tmp/valvenv
+        /tmp/valvenv/bin/pip install -q --upgrade pip
+        /tmp/valvenv/bin/pip install -q pymysql==1.2.0
+    - name: Validate shard (connectivity + unlock)
+      id: validate
+      env:
+        SHARD_INDEX: ${{ matrix.shard-index }}
+        SHARD_COUNT: '5'
+        TIMEOUT_PER_NODE: '25'
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_NAME: ${{ secrets.DB_NAME }}
+        MYSQL_PWD: ${{ secrets.DB_PASS }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        bash .github/scripts/validate_shard.sh
+    # Result persistence is best-effort (ADR 0002): even a failed write leaves
+    # the shard green. Runs even when the shard above failed so that whatever
+    # was measured still lands in MySQL.
+    - name: Store results to MySQL
+      if: always()
+      env:
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_NAME: ${{ secrets.DB_NAME }}
+        DB_PASS: ${{ secrets.DB_PASS }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        /tmp/valvenv/bin/python .github/scripts/store_results.py /tmp/results.tsv
