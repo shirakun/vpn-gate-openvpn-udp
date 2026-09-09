@@ -26,9 +26,13 @@ sleep_time = 0
 mirror_sites_file = MIRROR_SITES_FILE
 
 
-def run_update(base_url, retries=None, retry_interval=None, timeout=None):
+def run_update(base_url, retries=None, retry_interval=None, timeout=None,
+               alternate_base_urls=None):
     """
     Run one full update against the given base url.
+    alternate_base_urls: mirror sites that serve identical content; individual
+    config downloads that fail (e.g. "Connection reset by peer") are retried
+    from the next base in that list.
     Returns True only when the whole pipeline works (list page + per-row config
     downloads) and non-empty CSV/JSON files are produced.
     """
@@ -43,6 +47,7 @@ def run_update(base_url, retries=None, retry_interval=None, timeout=None):
         retries=retries,
         retry_interval=retry_interval,
         timeout=timeout,
+        alternate_base_urls=alternate_base_urls,
     )
     ok = bool(vpngate.run())
     end_time = datetime.now()
@@ -95,7 +100,11 @@ def main():
             # Success means the source responded and produced a snapshot; the
             # number of nodes is reported in the provenance but never used to
             # accept or reject a source.
-            ok = run_update(base_url, retries=1)
+            # The remaining mirrors are alternate download sources for config
+            # rows that hit "Connection reset by peer" on this base.
+            ok = run_update(base_url, retries=1,
+                            alternate_base_urls=[
+                                u for u in ordered if u != base_url])
             if ok:
                 source_type = "mirror"
                 source_url = base_url
@@ -107,7 +116,8 @@ def main():
     if not ok:
         print("All mirror sites failed or unavailable; fall back to official site {0}.".format(
             OFFICIAL_SITE_URL))
-        ok = run_update(OFFICIAL_SITE_URL)
+        ok = run_update(OFFICIAL_SITE_URL,
+                        alternate_base_urls=mirror_urls)
         if ok:
             source_type = "official"
             source_url = OFFICIAL_SITE_URL

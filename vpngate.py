@@ -19,11 +19,22 @@ MIRROR_SITES_PAGE_URL = OFFICIAL_SITE_URL + "/ja/sites.aspx"
 # The list page carries up to ~100 relays. Downloading every config in one
 # parallel burst per row makes the source (official or mirror) reset or close
 # the connections ("Connection reset by peer" / "Remote end closed"), silently
-# discarding most nodes: measured yield on a strict mirror is ~25 rows at 10
-# concurrent downloads vs ~96 at 3. Cap config downloads with a shared
-# semaphore (parsing stays threaded as before); 3 keeps near-full yield while
-# finishing well inside the 30-minute schedule.
-CONFIG_DOWNLOAD_CONCURRENCY = 3
+# discarding nodes: measured yields are ~25 rows at 10 concurrent downloads,
+# ~93-98 at 3, and a full 98/98 at 2 on a strict mirror, while a shared CI
+# egress can trigger resets even at 3. Cap config downloads with a shared
+# semaphore (parsing stays threaded as before) at 2, and when a download
+# fails, retry the same config from another mirror site whose content is
+# identical (only the base URL differs), so a reset burst no longer
+# permanently drops the affected rows.
+CONFIG_DOWNLOAD_CONCURRENCY = 2
+# Total download attempts allowed per config. The mirror bases are tried in
+# order (the site whose list page was parsed first, then each alternate
+# mirror); when no alternate is available the same URL is retried with a
+# short delay. Connection resets/refusals are transient throttling and
+# usually succeed from a different mirror once the burst has passed.
+CONFIG_DOWNLOAD_MAX_ATTEMPTS = 6
+# Seconds to wait between consecutive download attempts.
+CONFIG_DOWNLOAD_RETRY_BACKOFF = 1
 
 class VPNGateBase():
     # 网络请求参数 (与原有行为一致; 映像站快速尝试会覆盖为 1 次)
@@ -31,27 +42,32 @@ class VPNGateBase():
     _retry_interval = 10
     _timeout = 8
 
+    def _get_url_once(self, url):
+        """Fetch one URL a single time. Returns the decoded body or None."""
+        timeout = self._timeout
+        try:
+            req = request.Request(url)
+            with request.urlopen(req, timeout=timeout) as response:
+                if response.headers.get_content_charset() is None:
+                    encoding = 'utf-8'
+                else:
+                    encoding = response.headers.get_content_charset()
+                return response.read().decode(encoding)
+        except Exception as ex:
+            print(ERROR_MSG.format(
+                "_get_url", ex, datetime.now()))
+            return None
+
     def _get_url(self, url):
         max_retries = self._max_retries
         retry_interval = self._retry_interval
-        timeout = self._timeout
         for attempt in range(max_retries):
-            try:
-                req = request.Request(url)
-                with request.urlopen(req, timeout=timeout) as response:
-                    if response.headers.get_content_charset() == None:
-                        encoding = 'utf-8'
-                    else:
-                        encoding = response.headers.get_content_charset()
-                    html = response.read().decode(encoding)
+            html = self._get_url_once(url)
+            if html is not None:
                 return html
-            except Exception as ex:
-                print(ERROR_MSG.format(
-                    "_get_url", ex, datetime.now()))
-                if attempt < max_retries - 1:  # 如果不是最后一次尝试
-                    time.sleep(retry_interval)
-                else:
-                    return None
+            if attempt < max_retries - 1:  # 如果不是最后一次尝试
+                time.sleep(retry_interval)
+        return None
 
 
 class VPNGateItem(VPNGateBase, threading.Thread):
@@ -131,8 +147,7 @@ class VPNGateItem(VPNGateBase, threading.Thread):
 
     def __get_openvpn_config_base64(self, item_params):
         try:
-            request_url = self.__getattribute__('__base_url') + \
-                '/common/openvpn_download.aspx?sid=%s&%s&host=%s&port=%s&hid=%s&/vpngate_%s.ovpn'
+            download_path = '/common/openvpn_download.aspx?sid=%s&%s&host=%s&port=%s&hid=%s&/vpngate_%s.ovpn'
             for item in item_params:
                 props = item.split('=')
                 if len(props) < 2:
@@ -148,12 +163,43 @@ class VPNGateItem(VPNGateBase, threading.Thread):
                 elif props[0] == 'hid':
                     hid = props[1]
             if tcp_port != '0':
-                request_url = request_url % (
+                download_path = download_path % (
                     sid, 'tcp=1', ip, tcp_port, hid, ip + '_tcp_'+tcp_port)
             elif udp_port != '0':
-                request_url = request_url % (
+                download_path = download_path % (
                     sid, 'udp=1', ip, udp_port, hid, ip + '_udp_'+udp_port)
-            openvpn_config_string = self._get_url(request_url)
+            # Transient failures (connection reset / remote end closed) are
+            # mirror throttling of the download burst. Every mirror site serves
+            # identical content, so when a download fails try the same config
+            # URL against the next mirror base instead of dropping the row
+            # after one attempt; without alternates, retry the same base URL
+            # with a short delay so the reset burst passes.
+            bases = [self.__getattribute__('__base_url')]
+            try:
+                alternate_bases = list(
+                    self.__getattribute__('__alternate_base_urls') or [])
+            except AttributeError:
+                alternate_bases = []
+            for alternate_base in alternate_bases:
+                if alternate_base and alternate_base not in bases:
+                    bases.append(alternate_base)
+            if len(bases) > CONFIG_DOWNLOAD_MAX_ATTEMPTS:
+                # Keep total attempts bounded even with a long mirror list.
+                bases = bases[:CONFIG_DOWNLOAD_MAX_ATTEMPTS]
+            elif len(bases) == 1:
+                # No alternate mirror available: retry the same base URL.
+                bases = bases * CONFIG_DOWNLOAD_MAX_ATTEMPTS
+            openvpn_config_string = None
+            for attempt_index, base in enumerate(bases):
+                openvpn_config_string = self._get_url_once(
+                    base + download_path)
+                if openvpn_config_string is not None:
+                    break
+                if attempt_index < len(bases) - 1:
+                    print("Config download failed via {0} (attempt {1}/{2}); "
+                          "trying another mirror base.".format(
+                              base, attempt_index + 1, len(bases)))
+                    time.sleep(CONFIG_DOWNLOAD_RETRY_BACKOFF)
             if openvpn_config_string is None:
                 return None
             openvpn_config_string = re.sub(
@@ -229,8 +275,17 @@ class VPNGateItem(VPNGateBase, threading.Thread):
 class VPNGate(VPNGateBase):
 
     def __init__(self, __base_url, __file_path, __json_file_path, __sleep_time,
-                 retries=None, retry_interval=None, timeout=None):
+                 retries=None, retry_interval=None, timeout=None,
+                 alternate_base_urls=None):
         self.__base_url = __base_url
+        # Mirror sites that serve identical content; used to retry config
+        # downloads that hit transient failures such as "Connection reset by
+        # peer" on the primary base URL.
+        self.__alternate_base_urls = []
+        for alternate_url in (alternate_base_urls or []):
+            if (alternate_url and alternate_url != self.__base_url
+                    and alternate_url not in self.__alternate_base_urls):
+                self.__alternate_base_urls.append(alternate_url)
         self.__file_path = __file_path
         self.__json_file_path = __json_file_path
         self.__sleep_time = __sleep_time
@@ -271,7 +326,7 @@ class VPNGate(VPNGateBase):
 
     def __process_item(self, index, el):
         t = VPNGateItem()
-        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path, __json_file_path=self.__json_file_path, __sleep_time=self.__sleep_time, __list_server=self.__list_server, _max_retries=self._max_retries, _retry_interval=self._retry_interval, _timeout=self._timeout, __download_semaphore=self.__download_semaphore)
+        t._set_data(__index=index, __el=el, __base_url=self.__base_url, __file_path=self.__file_path, __json_file_path=self.__json_file_path, __sleep_time=self.__sleep_time, __list_server=self.__list_server, _max_retries=self._max_retries, _retry_interval=self._retry_interval, _timeout=self._timeout, __download_semaphore=self.__download_semaphore, __alternate_base_urls=self.__alternate_base_urls)
         self._threads.append(t)
         t.start()
 
