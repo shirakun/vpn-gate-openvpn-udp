@@ -3,7 +3,8 @@
 
 Reads the 14-column TSV written by validate_shard.sh and UPSERTs one row per
 node on the natural key node_id (UNIQUE uq_vpn_validate_node). A node's row is
-replaced in place, so each node keeps only its latest result; nodes removed
+replaced in place and re-tagged with the current RUN_ID, so each node keeps only
+its latest result and batch; nodes removed
 from vpn_nodes lose their results through the ON DELETE CASCADE foreign key.
 
 Result persistence is best-effort by design (see docs/adr/0002): this script
@@ -84,7 +85,7 @@ def main():
         print("No result rows to store.")
         return 0
 
-    update_cols = [c for c in RESULT_COLUMNS if c not in ("batch_id", "node_id")]
+    update_cols = [c for c in RESULT_COLUMNS if c != "node_id"]
     assignment = ", ".join("{0}=VALUES({0})".format(c) for c in update_cols)
     placeholders = ", ".join(["%s"] * len(RESULT_COLUMNS))
     upsert_sql = (
